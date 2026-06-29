@@ -1,3 +1,10 @@
+from dotenv import load_dotenv
+from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+from langchain_community.vectorstores import PGVector
+import os
+
+load_dotenv() # Carrega a sua chave do .env
+
 from fastapi import FastAPI, HTTPException, status
 from pydantic import BaseModel
 from typing import Optional
@@ -54,6 +61,11 @@ class ProducaoUpdate(BaseModel):
     nomeartigo: str
     anoartigo: Optional[int] = None
     issn: Optional[str] = None
+
+class QualisCreate(BaseModel):
+    issn: str
+    estrato: str
+    titulo_periodico: Optional[str] = None
 
 
 # ==============================================================================
@@ -126,7 +138,19 @@ def listar_producoes_por_pesquisador(pesquisador_id: str):
     conn = get_db_connection()
     cursor = conn.cursor(cursor_factory=RealDictCursor)
     try:
-        query = "SELECT * FROM producoes WHERE pesquisadores_id = %s"
+        # A MÁGICA ACONTECE AQUI: O banco faz o cruzamento e já devolve o estrato!
+        query = """
+            SELECT 
+                pr.producoes_id,
+                pr.pesquisadores_id,
+                pr.nomeartigo,
+                pr.anoartigo,
+                pr.issn,
+                q.estrato
+            FROM producoes pr
+            LEFT JOIN qualis q ON REPLACE(pr.issn, '-', '') = REPLACE(q.issn, '-', '')
+            WHERE pr.pesquisadores_id = %s;
+        """
         cursor.execute(query, (pesquisador_id,))
         producoes = cursor.fetchall()
         
@@ -183,3 +207,122 @@ def deletar_producao(produco_id: str):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Erro ao deletar produção: {e}")
     finally:
         conn.close()
+
+# ==============================================================================
+# ENDPOINTS: QUALIS (Catálogo CAPES)
+# ==============================================================================
+@app.get("/producoes", tags=["Produções"])
+def listar_todas_producoes():
+    conn = get_db_connection()
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        query = """
+            SELECT 
+                pr.producoes_id,
+                pr.pesquisadores_id,
+                pr.nomeartigo,
+                pr.anoartigo,
+                pr.issn,
+                q.estrato
+            FROM producoes pr
+            LEFT JOIN qualis q ON REPLACE(pr.issn, '-', '') = REPLACE(q.issn, '-', '')
+            LIMIT 100;
+        """
+        cursor.execute(query)
+        return cursor.fetchall()
+    finally:
+        cursor.close()
+        conn.close()
+
+@app.get("/qualis/{issn}", tags=["Qualis"])
+def buscar_qualis_por_issn(issn: str):
+    conn = get_db_connection()
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        # A mágica aqui é limpar o hífen dos dois lados antes de comparar
+        query = """
+            SELECT issn, estrato, qualis 
+            FROM qualis 
+            WHERE REPLACE(issn, '-', '') = REPLACE(%s, '-', '')
+        """
+        cursor.execute(query, (issn,))
+        resultado = cursor.fetchone()
+        
+        if not resultado:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, 
+                detail="ISSN não encontrado."
+            )
+        return resultado
+    finally:
+        cursor.close()
+        conn.close()
+
+@app.post("/qualis", status_code=status.HTTP_201_CREATED, tags=["Qualis"])
+def cadastrar_qualis(qualis: QualisCreate):
+    """
+    Cadastra uma nova revista científica ou atualiza o estrato de um ISSN existente.
+    """
+    conn = get_db_connection()
+    try:
+        with conn:
+            with conn.cursor() as cursor:
+                # Resolve inserção ou atualização caso o ISSN já exista (UPSERT)
+                query = """
+                    INSERT INTO qualis (issn, estrato, titulo_periodico) 
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (issn) 
+                    DO UPDATE SET estrato = EXCLUDED.estrato, titulo_periodico = EXCLUDED.titulo_periodico;
+                """
+                cursor.execute(query, (qualis.issn, qualis.estrato, qualis.titulo_periodico))
+        return {"message": "Registro Qualis processado com sucesso!"}
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, 
+            detail=f"Erro ao salvar registro no Qualis: {e}"
+        )
+    finally:
+        conn.close()
+
+# Mantenha a mesma CONNECTION_STRING que você usou nos outros arquivos
+CONNECTION_STRING = "postgresql+psycopg2://postgres:1234@172.22.224.1:5437/BD_PESQUISADOR"
+
+@app.get("/busca-ia", tags=["Inteligência Artificial"])
+def assistente_virtual(pergunta: str):
+    try:
+        # 1. Carrega os Embeddings e conecta no pgvector
+        embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+        db_vetorial = PGVector(
+            connection_string=CONNECTION_STRING,
+            embedding_function=embeddings,
+            collection_name="artigos_simcc"
+        )
+        
+        # 2. Busca Semântica (Acha os 3 artigos mais relevantes)
+        resultados = db_vetorial.similarity_search(pergunta, k=3)
+        
+        # Junta os títulos encontrados num texto só
+        contexto_artigos = "\n".join([f"- {doc.page_content}" for doc in resultados])
+        
+        # 3. ENGENHARIA DE PROMPT: Damos regras estritas para a IA
+        prompt = f"""Você é um assistente acadêmico do Observatório SIMCC.
+        Responda à pergunta do usuário baseando-se ÚNICA E EXCLUSIVAMENTE nos artigos abaixo.
+        Se os artigos não responderem à pergunta, diga: 'Desculpe, não encontrei publicações sobre isso.'
+        
+        Artigos encontrados no nosso banco:
+        {contexto_artigos}
+        
+        Pergunta do usuário: {pergunta}
+        """
+        
+        # 4. Chama o modelo de conversação (ChatGPT)
+        llm = ChatOpenAI(model="gpt-3.5-turbo", temperature=0)
+        resposta_ia = llm.invoke(prompt)
+        
+        return {
+            "pergunta": pergunta,
+            "resposta_ia": resposta_ia.content,
+            "artigos_referencia": [doc.metadata.get('producoes_id') for doc in resultados]
+        }
+    except Exception as e:
+        return {"erro": str(e)}
