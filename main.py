@@ -1,3 +1,4 @@
+from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_community.vectorstores import PGVector
@@ -15,6 +16,14 @@ app = FastAPI(
     title="API Observatório SIMCC",
     description="API robusta para o gerenciamento de pesquisadores e produções científicas.",
     version="1.1.0"
+    
+)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], # Permite que qualquer front-end se conecte
+    allow_credentials=True,
+    allow_methods=["*"], # Permite GET, POST, OPTIONS, etc.
+    allow_headers=["*"],
 )
 
 # ==============================================================================
@@ -290,21 +299,23 @@ CONNECTION_STRING = "postgresql+psycopg2://postgres:1234@172.22.224.1:5437/BD_PE
 @app.get("/busca-ia", tags=["Inteligência Artificial"])
 def assistente_virtual(pergunta: str):
     try:
-        # 1. Carrega os Embeddings e conecta no pgvector
+        print("\n[IA LOG] 1. Recebendo pergunta e iniciando Embeddings...")
         embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+        
+        print("[IA LOG] 2. Conectando ao PGVector no PostgreSQL...")
         db_vetorial = PGVector(
             connection_string=CONNECTION_STRING,
             embedding_function=embeddings,
             collection_name="artigos_simcc"
         )
         
-        # 2. Busca Semântica (Acha os 3 artigos mais relevantes)
+        print(f"[IA LOG] 3. Executando busca semântica para: '{pergunta}'...")
         resultados = db_vetorial.similarity_search(pergunta, k=3)
         
-        # Junta os títulos encontrados num texto só
+        print(f"[IA LOG] 4. Busca concluída. Encontrados {len(resultados)} artigos.")
         contexto_artigos = "\n".join([f"- {doc.page_content}" for doc in resultados])
         
-        # 3. ENGENHARIA DE PROMPT: Damos regras estritas para a IA
+        print("[IA LOG] 5. Montando o Prompt de Engenharia...")
         prompt = f"""Você é um assistente acadêmico do Observatório SIMCC.
         Responda à pergunta do usuário baseando-se ÚNICA E EXCLUSIVAMENTE nos artigos abaixo.
         Se os artigos não responderem à pergunta, diga: 'Desculpe, não encontrei publicações sobre isso.'
@@ -315,14 +326,16 @@ def assistente_virtual(pergunta: str):
         Pergunta do usuário: {pergunta}
         """
         
-        # 4. Chama o modelo de conversação (ChatGPT)
+        print("[IA LOG] 6. Chamando a API da OpenAI (ChatOpenAI)...")
         llm = ChatOpenAI(model="gpt-3.5-turbo", temperature=0)
         resposta_ia = llm.invoke(prompt)
         
+        print("[IA LOG] 7. Resposta recebida da IA com sucesso! Retornando dados...")
         return {
             "pergunta": pergunta,
             "resposta_ia": resposta_ia.content,
             "artigos_referencia": [doc.metadata.get('producoes_id') for doc in resultados]
         }
     except Exception as e:
+        print(f"[IA LOG] ❌ ERRO ENCONTRADO: {str(e)}")
         return {"erro": str(e)}
